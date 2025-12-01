@@ -9,22 +9,29 @@ import ollama
 from datetime import datetime
 import time
 import hashlib
+import numpy as np
 
-def make_id(text):
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
 
 # --------------------------
-# Database Class
-# --------------------------
-
+# Memory Class
+# -------------------------- 
 class MemoryChroma:
-    def __init__(self):
+    def __init__(self, fetch_response_fn):
         self.db = chromadb.PersistentClient()
         if "ai_memories" in [c.name for c in self.db.list_collections()]:
             self.memories = self.db.get_collection("ai_memories")
         else:
-            self.memories = self.db.create_collection("ai_memories")
-
+            self.memories = self.db.create_collection("ai_memories",embedding_function=None,metadata={"hnsw:space": "cosine"})
+        self.short_memory = []
+        self.active_long_memories = set()
+        self.fetch_response = fetch_response_fn
+        print(self.memories._client.get_collection("ai_memories").metadata)
+        
+    def normalise_vec(self,v):
+        vec = v / np.linalg.norm(v)
+        return vec.tolist()
+    
     def embed_text(self, text):
         response = ollama.embeddings(
             model="nomic-embed-text",
@@ -32,190 +39,318 @@ class MemoryChroma:
         )
         return response["embedding"]
 
+    def summarise(self, text):
+        msg = (
+            "Summarize the following text concisely in one sentence, "
+            "capturing only the main facts, decisions or important details: "
+            + text
+        )
+        return self.fetch_response(msg)
+    
+    def generate_tags(self, text):
+        prompt = f"""
+            Extract 3–6 high-level semantic tags that capture the core concepts.
+
+            Output the tags as a JSON array of strings only, like:
+            ["tag1", "tag2", "tag3"]
+
+            If you add any other text, still ensure the array appears exactly once
+            in that format so it can be extracted.
+
+            Text: {text}
+        """
+        tag_string = self.fetch_response(prompt)
+        tags = re.findall(r'"(.*?)"', tag_string)
+        return tags
+        
+    def make_id(self,text):
+        return hashlib.sha256(text.encode()).hexdigest()[:16]
     def add_memory(self, content):
-        vector = self.embed_text(content)
+        summary_content = self.summarise(content)
+        tag_content = self.generate_tags(content)
+        vector = np.array(self.embed_text(content))
+        normalised_vec = self.normalise_vec(vector)
         current_date = datetime.now().isoformat()
         timestamp = time.time()
-        id = make_id(content)
-        metadata = {
-            "date": current_date,
-            "recency": timestamp
-        }
+        id = self.make_id(content + f"{timestamp}")
+        metadata = {"date": current_date, "recency": timestamp, "tags": json.dumps(tag_content)}
         self.memories.add(
-            documents=[content],
-            embeddings=[vector],
+            documents=[summary_content],
+            embeddings=[normalised_vec],
             metadatas=[metadata],
             ids=[id]
-
         )
+    def should_save_memory(self, text):
+        prompt = f"""
+        Should this conversation be stored as long-term memory? Only consider:
+        - Facts about the user
+        - Emotional significance
+        - Preferences or personality updates
 
-    def get_memories(self, message, memory_limit=5, threshold=0.75, weight_similarity=0.7, weight_recency=0.3):
-        # embed query
-        query_vec = self.embed_text(message)
-        # query Chroma
+        Answer only 'Yes' or 'No'.
+        Exchange: {text}
+        """
+        response = self.fetch_response(prompt)
+        response = response.strip().lower()
+        if response.startswith("y"):   # matches 'Yes'
+            return True
+        else:                           # anything else treated as No
+            return False
+    def get_memories(self, message, memory_limit=5, threshold=0.55, weight_similarity=1.0):
+        query_vec = np.array(self.embed_text(message))
+        tag_message = self.generate_tags(message)
+        normalised_query_vec = self.normalise_vec(query_vec)
+
         results = self.memories.query(
-            query_embeddings=[query_vec],
+            query_embeddings=[normalised_query_vec],
             n_results=50
         )
 
         docs = results['documents'][0]
-        distances = results['distances'][0]      # similarity scores
+        distances = results['distances'][0]
         metadatas = results['metadatas'][0]
 
-        # compute combined score per memory
-        combined_scores = []
-        for doc, sim, meta in zip(docs, distances, metadatas):
+        combined = []
+        tag_memories = []
+
+        for doc, dist, meta in zip(docs, distances, metadatas):
+
+            # Convert distance -> similarity
+            sim = 1 - dist  
+
+            # Tags (safe default: [])
+            tags = json.loads(meta.get("tags", []))
+
+            # Tag overlap
+            common_tags = set(tag_message) & set(tags)
+            if common_tags:
+                tag_memories.append(doc)
+
+            # Skip memories below similarity threshold
             if sim < threshold:
-                continue  # skip irrelevant memories
+                continue
 
-            # compute recency score (normalize 0-1)
-            recency_score = meta.get('recency', 0) / time.time()
-            combined_score = weight_similarity * sim + weight_recency * recency_score
-            combined_scores.append((doc, combined_score, meta))
+            combined.append((doc, sim))
 
-        # sort by combined score descending
-        combined_scores.sort(key=lambda x: x[1], reverse=True)
+        # Sort by similarity
+        combined.sort(key=lambda x: x[1], reverse=True)
 
-        # limit to top N memories
-        final_docs = [doc for doc, score, meta in combined_scores[:memory_limit]]
+        # Take top N semantic memories
+        semantic_results = [doc for doc, score in combined[:memory_limit]]
 
-        return final_docs
+        # Deduplicate while keeping order
+        final = []
+        seen = set()
+        for doc in [*semantic_results, *tag_memories]:
+            if doc not in seen:
+                seen.add(doc)
+                final.append(doc)
 
-#hello
+        return final
+
+
+    def get_relevant_memories(self, message):
+        memories = self.get_memories(message)
+
+        count = 0
+        for m in memories:
+            if m not in self.active_long_memories:
+                self.active_long_memories.add(m)
+            count += 1
+
+        return count
+
 
 # --------------------------
-# Memory Variables
+# personality growth
 # --------------------------
-memory = MemoryChroma()
-short_memory = []  # short-term (conversation context)
-active_long_memories = set()  # working set (long-term context)
+class Personality_module:
+    def __init__(self, personality_file, fetch_response_fn):
+        self.personality_file = personality_file
+        self.fetch_response = fetch_response_fn
 
+    def emotion_buffer(self, text):
+        prompt = f"""
+        Please state how this exchange would make the person labelled bot feel, including negative emotions if they are present.
+        Describe in 3–4 sentences:
+        - how bot emotionally feels about this exchange
+        - why it feels that way (briefly)
+        Do NOT output chain-of-thought or analysis steps. 
+        Use natural language emotion labels.
 
+        Exchange: {text}
+        """
+        response = self.fetch_response(prompt)
+        response = response.strip().lower()
+        return response
 
-
-def fetch_response(message):
-    prompt = json.dumps({
-        "model": "gpt-oss:20b",
-        "prompt": message
-    })
-
-    response = requests.post(
-        "http://localhost:11434/api/generate",
-        headers={"Content-Type": "application/json"},
-        data=prompt,
-        stream=True
-    )
-    message_out = ""
-    for line in response.iter_lines():
+    def _load_personality(self):
         try:
-            obj = json.loads(line)
-            if "response" in obj:
-                message_out += obj["response"]
-        except:
-            continue
-    return message_out
-# --------------------------
-# memory saving
-# --------------------------
-def should_save_memory(text):
-    prompt = f"""
-    Should this conversation be stored as long-term memory? Only consider:
-    - Facts about the user
-    - Emotional significance
-    - Preferences or personality updates
+            with open(self.personality_file, "r") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
 
-    Answer only 'Yes' or 'No'.
-    Exchange: {text}
-    """
-    response = fetch_response(prompt)
-    response = response.strip().lower()
-    if response.startswith("y"):   # matches 'Yes'
-        return True
-    else:                           # anything else treated as No
-        return False
-
-# --------------------------
-# Summary Generation
-# --------------------------
-def summarise(prompt):
-    summary_message = f'Summarize the following text concisely in one sentence, capturing the main facts, decisions, or important details only: {prompt}'
-    summary = fetch_response(summary_message)
-    return summary
-# --------------------------
-# Memory Retrieval
-# --------------------------
-def get_relevant_memories(message):
-    global active_long_memories
-    summary_message = summarise(message)
-    memories = memory.get_memories(summary_message)
-    count = 0
-    for m in memories:
-        count += 1
-        if m not in active_long_memories:
-            active_long_memories.add(m)
-    return count
-
-
-# --------------------------
-# Message Handling
-# --------------------------
-def send_message():
-    current_msg = my_entry.get().strip()
-    if not current_msg:
-        return
-
-    # --- Add long-term memories ---
-    count = get_relevant_memories(current_msg)
-    message = """
-        You have a long-term memory database and are provided with the last prompts and responses (short term memory..
-        Do not end responses with generic sign-offs such as "Have a nice day," "Take care," or similar phrases. 
-        If any previous prompts are provided don't respond with an introdcution or greeting, just continue the conversation.
-        You are designed to be a conversational AI so don't provide rambling or technical responses unless specifically requested.
-        \nRelevant long-term memories:\n
-    """
+    def _save_personality(self, existing_personality):
+        with open(self.personality_file, "w") as f:
+            json.dump(existing_personality, f, indent=4)
     
-    for m in active_long_memories:
-        message += f"- {m}\n"
+    def personality_traits_growth(self, emotions_string):
+        prompt = f"""
+        You are determining personality traits that would increase in strength 
+        based on the following emotional reflection.
 
-    # --- Add the previous conversation ---
-    message += "\nPrevious prompts and responses in this chat session:\n"
-    for content in short_memory:
-        message += f"\n {content}\n"
+        Provide ONLY a JSON array of strings.
+        1 to 5 traits max.
+        Traits should be short (1–3 words each).
+        Do not explain.
 
-    # --- Add the current prompt ---
-    message += "\nCurrent prompt:\n"
-    message += current_msg
+        Feelings: {emotions_string}
 
-    # Display user message
-    chat_area.config(state='normal')
-    chat_area.insert(tk.END, f"You: {current_msg}\n")
-    chat_area.config(state='disabled')
-    my_entry.delete(0, 'end')
+        Output example:
+        ["trait1", "trait2"]
+        """
+        response = self.fetch_response(prompt).strip()
+        existing_personality = self._load_personality()
+        traits = re.findall(r'"(.*?)"', response)
+        for trait in traits:
+            if trait in existing_personality:
+                existing_personality[trait] += 0.08
+                if existing_personality[trait] > 1.0:
+                    existing_personality[trait] = 1.0
+            else:
+                existing_personality[trait] = 0.2
+        self._save_personality(existing_personality)
+        
+    def personality_traits_decay(self, emotions_string):
+        prompt = f"""
+        You are determining which personality traits would weaken or decrease in relevance
+        based on the following emotional reflection.
 
-    short_memory.append(f"User: {current_msg}")
+        Provide ONLY a JSON array of strings.
+        1 to 5 traits max.
+        Traits should be short (1–3 words each).
+        Do not explain.
 
-    response = fetch_response(message)
+        Feelings: {emotions_string}
 
-    chat_area.config(state='normal')
-    last_exchange = f"User: {current_msg}\nBot: {response}"
-    bool_message = should_save_memory(last_exchange)
-    print(bool_message)
-    if bool_message or count == 0:
-        summary_last_exchange = summarise(last_exchange)
-        memory.add_memory(summary_last_exchange)
+        Output example:
+        ["trait1", "trait2"]
+        """
+        response = self.fetch_response(prompt).strip()
+        existing_personality = self._load_personality()
+        traits = re.findall(r'"(.*?)"', response)
+        for trait in traits:
+            if trait in existing_personality:
+                existing_personality[trait] -= 0.05
+                if existing_personality[trait] <= 0.0:
+                    existing_personality.pop(trait)
+        self._save_personality(existing_personality)
+            
+    def update_personality(self, text):
+        emotion_string = self.emotion_buffer(text)
+        self.personality_traits_growth(emotion_string)
+        self.personality_traits_decay(emotion_string)
     
+    def generate_personality(self):
+        current_personality = self._load_personality()
+        personality_string = "Personality strength parameters:\n"
+        for key, value in current_personality.items():
+            if value > 0.8:
+                personality_string += f"{key}: very strong\n"
+            elif value > 0.5:
+                personality_string += f"{key}: strong\n"
+            elif value > 0.2:
+                personality_string += f"{key}: medium\n"
+            else:
+                personality_string += f"{key}: weak\n"
+        return personality_string
 
-    short_memory.append(f"Bot: {response}")
-    chat_area.insert(tk.END, f"Bot: {response}\n")
+# --------------------------
+# Chatbot Core
+# --------------------------
+class Chatbot:
+    def __init__(self):
+        self.memory = MemoryChroma(self.fetch_response)
+        self.personality = Personality_module("personality_v1.json", self.fetch_response)
+        self.short_memory = []
 
+    def fetch_response(self, message):
+        prompt = json.dumps({
+            "model": "gpt-oss:20b",
+            "prompt": message
+        })
 
-    chat_area.config(state='disabled')
-    chat_area.yview(tk.END)  # auto-scroll to bottom
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            headers={"Content-Type": "application/json"},
+            data=prompt,
+            stream=True
+        )
+        message_out = ""
+        for line in response.iter_lines():
+            try:
+                obj = json.loads(line)
+                if "response" in obj:
+                    message_out += obj["response"]
+            except:
+                continue
+        return message_out
+        
+    def send_message(self):
+        current_msg = my_entry.get().strip()
+        if not current_msg:
+            return
 
-    #print("Short-term memory:", short_memory)
-    print("Active long-term memories:", active_long_memories)
+        # --- Add long-term memories ---
+        count = self.memory.get_relevant_memories(current_msg)
 
+        message = """
+        You are designed to be as human like as possible, to meet this end you have been given;
+        A long-term memory database and are provided with the last prompts and responses (short term memory).
+        Ontop of this as you create memories, these memories update your personality allowing you to grow as a person would.
+        Your personality is displayed as a series of traits and strengths.
+        Do not end responses with generic sign-offs. 
+        Keep responses concise and human like and attempt to continue the conversation naturally.
+        Do not produce numbered lists unless requested keep to a regular spoken format.
+        """
+        
+        current_personality = self.personality.generate_personality()
+        message += f"\n{current_personality}\n"
+        
+        message += "Relevant long-term memories:"
+        for m in self.memory.active_long_memories:
+            message += f"- {m}\n"
 
+        message += "\nPrevious prompts and responses in this chat session:\n"
+        for content in self.memory.short_memory:
+            message += f"\n {content}\n"
+
+        message += "\nCurrent prompt:\n"
+        message += current_msg
+
+        chat_area.config(state='normal')
+        chat_area.insert(tk.END, f"You: {current_msg}\n")
+        chat_area.config(state='disabled')
+        my_entry.delete(0, 'end')
+
+        self.memory.short_memory.append(f"User: {current_msg}")
+
+        response = self.fetch_response(message)
+
+        chat_area.config(state='normal')
+        last_exchange = f"User: {current_msg}\nBot: {response}"
+        bool_message = self.memory.should_save_memory(last_exchange)
+        if bool_message or count == 0:
+            self.personality.update_personality(last_exchange)
+            self.memory.add_memory(last_exchange)
+
+        self.memory.short_memory.append(f"Bot: {response}")
+        chat_area.insert(tk.END, f"Bot: {response}\n")
+        chat_area.config(state='disabled')
+        chat_area.yview(tk.END)
+
+        print("Active long-term memories:", self.memory.active_long_memories)
 
 
 # --------------------------
@@ -237,17 +372,16 @@ chat_area.grid(row=0, column=0, columnspan=2, sticky='nsew', padx=5, pady=5)
 
 my_entry = tk.Entry(frame)
 my_entry.grid(row=1, column=0, sticky='ew', padx=5, pady=5, ipady=5)
-# Here is the code to make it grow vertically when text overflows horizontally
-# The width attribute of Entry widget can be set dynamically based on content. 
-my_entry['width'] = 1 # Set a default value for initial display
+my_entry['width'] = 1
 
 def resize_textarea(event):
-    my_entry['width'] = len(event.widget.get()) + 1 # +1 for padding
-    
-# Bind the event when there is any interaction with Entry widget, so that it can adjust its width dynamically 
+    my_entry['width'] = len(event.widget.get()) + 1
+
 my_entry.bind('<Key>', resize_textarea)
 
-send_button = tk.Button(frame, text="Send", width=10, command=send_message)
+chatbot = Chatbot()
+
+send_button = tk.Button(frame, text="Send", width=10, command=chatbot.send_message)
 send_button.grid(row=1, column=1, sticky='e', padx=5, pady=5)
 
 root.mainloop()
