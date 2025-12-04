@@ -10,34 +10,45 @@ from datetime import datetime
 import time
 import hashlib
 import numpy as np
+from gensim.models import KeyedVectors
 
 
 
 # --------------------------
 # Memory Class
 # -------------------------- 
-class MemoryChroma:
+class Memory_module:
     def __init__(self, fetch_response_fn):
         self.db = chromadb.PersistentClient()
         if "ai_memories" in [c.name for c in self.db.list_collections()]:
             self.memories = self.db.get_collection("ai_memories")
         else:
-            self.memories = self.db.create_collection("ai_memories",embedding_function=None,metadata={"hnsw:space": "cosine"})
+            self.memories = self.db.create_collection(
+                "ai_memories",
+                embedding_function=None,
+                metadata={"hnsw:space": "cosine"}
+            )
         self.short_memory = []
         self.active_long_memories = set()
         self.fetch_response = fetch_response_fn
-        print(self.memories._client.get_collection("ai_memories").metadata)
-        
-    def normalise_vec(self,v):
-        vec = v / np.linalg.norm(v)
-        return vec.tolist()
-    
-    def embed_text(self, text):
-        response = ollama.embeddings(
-            model="nomic-embed-text",
-            prompt=text
+        self.model = KeyedVectors.load_word2vec_format(
+            "../../word2vec/GoogleNews-vectors-negative300.bin.gz",
+            binary=True
         )
-        return response["embedding"]
+        self.embedding_dim = 300  # Word2Vec GoogleNews default
+
+    def normalise_vec(self, v):
+        norm = np.linalg.norm(v)
+        if norm == 0:
+            return np.zeros_like(v).tolist()
+        return (v / norm).tolist()
+
+    def cosine(self, a, b):
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return float(np.dot(a, b) / (norm_a * norm_b))
 
     def summarise(self, text):
         msg = (
@@ -46,40 +57,54 @@ class MemoryChroma:
             + text
         )
         return self.fetch_response(msg)
-    
-    def generate_tags(self, text):
+
+    def generate_tag(self, text):
         prompt = f"""
-            Extract 3–6 high-level semantic tags that capture the core concepts.
+            From the following text, extract **one single high-level keyword** 
+            that best captures the core concept.
 
-            Output the tags as a JSON array of strings only, like:
-            ["tag1", "tag2", "tag3"]
+            Output ONLY a JSON array containing exactly one string, like:
+            ["keyword"]
 
-            If you add any other text, still ensure the array appears exactly once
-            in that format so it can be extracted.
+            If you include any other text, still ensure the array appears
+            exactly once in that format so it can be extracted.
 
             Text: {text}
         """
         tag_string = self.fetch_response(prompt)
-        tags = re.findall(r'"(.*?)"', tag_string)
-        return tags
-        
-    def make_id(self,text):
+        tag = re.findall(r'"(.*?)"', tag_string)
+        print(tag)
+        return tag[0].lower() if tag else None  # lowercase for word2vec
+
+    def make_id(self, text):
         return hashlib.sha256(text.encode()).hexdigest()[:16]
+
     def add_memory(self, content):
         summary_content = self.summarise(content)
-        tag_content = self.generate_tags(content)
-        vector = np.array(self.embed_text(content))
+        tag_content = self.generate_tag(content)
+
+        # safely get embedding
+        if tag_content and tag_content in self.model:
+            vector = np.array(self.model[tag_content])
+        else:
+            vector = np.zeros(self.embedding_dim)
+
         normalised_vec = self.normalise_vec(vector)
         current_date = datetime.now().isoformat()
         timestamp = time.time()
-        id = self.make_id(content + f"{timestamp}")
-        metadata = {"date": current_date, "recency": timestamp, "tags": json.dumps(tag_content)}
+        memory_id = self.make_id(content + f"{timestamp}")
+        metadata = {
+            "date": current_date,
+            "recency": timestamp,
+            "embedding": json.dumps(normalised_vec)
+        }
         self.memories.add(
             documents=[summary_content],
             embeddings=[normalised_vec],
             metadatas=[metadata],
-            ids=[id]
+            ids=[memory_id]
         )
+
     def should_save_memory(self, text):
         prompt = f"""
         Should this conversation be stored as long-term memory? Only consider:
@@ -91,14 +116,15 @@ class MemoryChroma:
         Exchange: {text}
         """
         response = self.fetch_response(prompt)
-        response = response.strip().lower()
-        if response.startswith("y"):   # matches 'Yes'
-            return True
-        else:                           # anything else treated as No
-            return False
-    def get_memories(self, message, memory_limit=5, threshold=0.55, weight_similarity=1.0):
-        query_vec = np.array(self.embed_text(message))
-        tag_message = self.generate_tags(message)
+        return response.strip().lower().startswith("y")
+
+    def get_memories(self, message, memory_limit=5, threshold=0.55):
+        tag_message = self.generate_tag(message)
+        if tag_message and tag_message in self.model:
+            query_vec = np.array(self.model[tag_message])
+        else:
+            query_vec = np.zeros(self.embedding_dim)
+
         normalised_query_vec = self.normalise_vec(query_vec)
 
         results = self.memories.query(
@@ -107,58 +133,28 @@ class MemoryChroma:
         )
 
         docs = results['documents'][0]
-        distances = results['distances'][0]
         metadatas = results['metadatas'][0]
 
         combined = []
-        tag_memories = []
-
-        for doc, dist, meta in zip(docs, distances, metadatas):
-
-            # Convert distance -> similarity
-            sim = 1 - dist  
-
-            # Tags (safe default: [])
-            tags = json.loads(meta.get("tags", []))
-
-            # Tag overlap
-            common_tags = set(tag_message) & set(tags)
-            if common_tags:
-                tag_memories.append(doc)
-
-            # Skip memories below similarity threshold
+        for doc, meta in zip(docs, metadatas):
+            vec = np.array(json.loads(meta.get("embedding", np.zeros(self.embedding_dim))))
+            sim = self.cosine(vec, normalised_query_vec)
             if sim < threshold:
                 continue
-
             combined.append((doc, sim))
 
-        # Sort by similarity
         combined.sort(key=lambda x: x[1], reverse=True)
-
-        # Take top N semantic memories
-        semantic_results = [doc for doc, score in combined[:memory_limit]]
-
-        # Deduplicate while keeping order
-        final = []
-        seen = set()
-        for doc in [*semantic_results, *tag_memories]:
-            if doc not in seen:
-                seen.add(doc)
-                final.append(doc)
-
-        return final
-
+        return [doc for doc, _ in combined[:memory_limit]]
 
     def get_relevant_memories(self, message):
         memories = self.get_memories(message)
-
         count = 0
         for m in memories:
             if m not in self.active_long_memories:
                 self.active_long_memories.add(m)
             count += 1
-
         return count
+
 
 
 # --------------------------
@@ -271,9 +267,8 @@ class Personality_module:
 # --------------------------
 class Chatbot:
     def __init__(self):
-        self.memory = MemoryChroma(self.fetch_response)
+        self.memory = Memory_module(self.fetch_response)
         self.personality = Personality_module("personality_v1.json", self.fetch_response)
-        self.short_memory = []
 
     def fetch_response(self, message):
         prompt = json.dumps({
